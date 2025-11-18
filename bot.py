@@ -26,6 +26,10 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 # YouTube DL options
+import os.path
+
+cookies_file = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'extractaudio': True,
@@ -33,14 +37,19 @@ ytdl_format_options = {
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': False,  # Changed to allow playlists
+    'playlistend': 50,  # Limit playlists to first 50 songs
     'nocheckcertificate': True,
     'ignoreerrors': False,
     'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
+    'quiet': True,  # Back to quiet mode
+    'no_warnings': True,  # Back to no warnings
     'default_search': 'auto',
     'source_address': '0.0.0.0',
 }
+
+# Add cookies if file exists
+if os.path.isfile(cookies_file):
+    ytdl_format_options['cookiefile'] = cookies_file
 
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -120,6 +129,28 @@ async def on_ready():
     print(f'Bot is in {len(bot.guilds)} guilds')
 
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Event handler for voice state changes."""
+    # Check if someone left a voice channel
+    if before.channel is not None and after.channel != before.channel:
+        # Get the bot's voice client for this guild
+        voice_client = member.guild.voice_client
+        
+        # If bot is in a voice channel
+        if voice_client and voice_client.channel:
+            # Count non-bot members in the channel
+            members = [m for m in voice_client.channel.members if not m.bot]
+            
+            # If bot is alone (only bots left), disconnect
+            if len(members) == 0:
+                queue = get_queue(member.guild.id)
+                queue.clear()
+                await voice_client.disconnect()
+                print(f"Auto-disconnected from {voice_client.channel.name} - channel empty")
+
+
+
 @bot.command(name='join', help='Makes the bot join the voice channel')
 async def join(ctx):
     """Join the voice channel of the user."""
@@ -163,37 +194,72 @@ async def play(ctx, *, url):
         await channel.connect()
     elif ctx.voice_client.channel != channel:
         await ctx.voice_client.move_to(channel)
+    
+    # Clean YouTube Music URLs - remove auto-playlist parameters
+    if 'music.youtube.com' in url and '&list=' in url:
+        # Extract just the video ID for single song playback
+        url = url.split('&list=')[0]
 
     async with ctx.typing():
         try:
-            # Extract info first to check if it's a playlist
             loop = bot.loop or asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
             
-            # Check if it's a playlist
-            if 'entries' in data:
-                # It's a playlist
-                entries = data['entries']
-                playlist_title = data.get('title', 'playlist')
-                queue = get_queue(ctx.guild.id)
+            # Quick check if it's a playlist URL
+            is_playlist_url = ('playlist' in url or ('youtube.com/watch' in url and 'list=' in url and '&list=RDAMVM' not in url))
+            
+            if is_playlist_url:
+                # For playlists: extract only basic info, don't download full metadata
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False, process=False))
                 
-                # Add all songs to queue
-                added_count = 0
-                for entry in entries:
-                    if entry:  # Some entries might be None
-                        song_url = entry.get('webpage_url') or entry.get('url')
-                        song_title = entry.get('title', 'Unknown')
-                        queue.add({'url': song_url, 'title': song_title, 'ctx': ctx})
-                        added_count += 1
-                
-                await ctx.send(f'📝 Added **{added_count}** songs from playlist: **{playlist_title}**')
-                
-                # Start playing if nothing is playing
-                if not ctx.voice_client.is_playing():
-                    await play_next(ctx)
+                if 'entries' in data and data.get('_type') == 'playlist':
+                    entries = data['entries']
+                    playlist_title = data.get('title', 'playlist')
+                    queue = get_queue(ctx.guild.id)
+                    
+                    # Only get URLs quickly, don't fetch full metadata yet
+                    added_count = 0
+                    for entry in entries:
+                        if entry:
+                            # For playlists, just store the video ID/URL
+                            video_id = entry.get('id') or entry.get('url')
+                            if video_id:
+                                song_url = f"https://www.youtube.com/watch?v={video_id}" if len(video_id) == 11 else entry.get('url')
+                                song_title = entry.get('title', 'Unknown')
+                                queue.add({'url': song_url, 'title': song_title, 'ctx': ctx})
+                                added_count += 1
+                    
+                    await ctx.send(f'📝 Added **{added_count}** songs from playlist: **{playlist_title}**\nStarting playback...')
+                    
+                    # Start playing immediately
+                    if not ctx.voice_client.is_playing():
+                        await play_next(ctx)
+                else:
+                    # Fallback to single video
+                    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+                    if 'entries' in data:
+                        data = data['entries'][0]
+                    filename = data['url']
+                    player = YTDLSource(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+                    
+                    if ctx.voice_client.is_playing():
+                        queue = get_queue(ctx.guild.id)
+                        queue.add({'url': url, 'title': player.title, 'ctx': ctx})
+                        await ctx.send(f'Added to queue: **{player.title}**')
+                    else:
+                        ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
+                            play_next(ctx), bot.loop))
+                        await ctx.send(f'Now playing: **{player.title}**')
             else:
-                # Single video
-                player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+                # Single video - full processing
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+                
+                # Handle search results or direct URLs
+                if 'entries' in data:
+                    data = data['entries'][0]
+                
+                # Create player from the data
+                filename = data['url']
+                player = YTDLSource(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
                 
                 if ctx.voice_client.is_playing():
                     queue = get_queue(ctx.guild.id)
@@ -205,6 +271,7 @@ async def play(ctx, *, url):
                     await ctx.send(f'Now playing: **{player.title}**')
         except Exception as e:
             await ctx.send(f'An error occurred: {str(e)}')
+            print(f'Error in play command: {e}')  # Log to console for debugging
 
 
 async def play_next(ctx):
