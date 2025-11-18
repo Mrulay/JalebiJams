@@ -40,6 +40,7 @@ ytdl_format_options = {
     'no_warnings': True,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
+    'cookiesfrombrowser': ('firefox',),  # Use Firefox cookies to bypass bot detection
 }
 
 ffmpeg_options = {
