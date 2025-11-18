@@ -32,7 +32,7 @@ ytdl_format_options = {
     'audioformat': 'mp3',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
-    'noplaylist': True,
+    'noplaylist': False,  # Changed to allow playlists
     'nocheckcertificate': True,
     'ignoreerrors': False,
     'logtostderr': False,
@@ -166,16 +166,43 @@ async def play(ctx, *, url):
 
     async with ctx.typing():
         try:
-            player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+            # Extract info first to check if it's a playlist
+            loop = bot.loop or asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
             
-            if ctx.voice_client.is_playing():
+            # Check if it's a playlist
+            if 'entries' in data:
+                # It's a playlist
+                entries = data['entries']
+                playlist_title = data.get('title', 'playlist')
                 queue = get_queue(ctx.guild.id)
-                queue.add({'url': url, 'title': player.title, 'ctx': ctx})
-                await ctx.send(f'Added to queue: **{player.title}**')
+                
+                # Add all songs to queue
+                added_count = 0
+                for entry in entries:
+                    if entry:  # Some entries might be None
+                        song_url = entry.get('webpage_url') or entry.get('url')
+                        song_title = entry.get('title', 'Unknown')
+                        queue.add({'url': song_url, 'title': song_title, 'ctx': ctx})
+                        added_count += 1
+                
+                await ctx.send(f'📝 Added **{added_count}** songs from playlist: **{playlist_title}**')
+                
+                # Start playing if nothing is playing
+                if not ctx.voice_client.is_playing():
+                    await play_next(ctx)
             else:
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                    play_next(ctx), bot.loop))
-                await ctx.send(f'Now playing: **{player.title}**')
+                # Single video
+                player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+                
+                if ctx.voice_client.is_playing():
+                    queue = get_queue(ctx.guild.id)
+                    queue.add({'url': url, 'title': player.title, 'ctx': ctx})
+                    await ctx.send(f'Added to queue: **{player.title}**')
+                else:
+                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
+                        play_next(ctx), bot.loop))
+                    await ctx.send(f'Now playing: **{player.title}**')
         except Exception as e:
             await ctx.send(f'An error occurred: {str(e)}')
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=JalebiJams Discord Music Bot
+After=network.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_YOUR_USERNAME
+WorkingDirectory=/home/REPLACE_WITH_YOUR_USERNAME/JalebiJams
+Environment="PATH=/home/REPLACE_WITH_YOUR_USERNAME/JalebiJams/venv/bin"
+ExecStart=/home/REPLACE_WITH_YOUR_USERNAME/JalebiJams/venv/bin/python /home/REPLACE_WITH_YOUR_USERNAME/JalebiJams/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
