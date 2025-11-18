@@ -1,0 +1,16 @@
+# Python Discord Music Bot Dependencies
+
+# Discord.py - Discord API wrapper
+discord.py[voice]>=2.3.0
+
+# yt-dlp - YouTube video/audio downloader
+yt-dlp>=2024.07.01
+
+# PyNaCl - Voice support for Discord.py
+PyNaCl>=1.5.0
+
+# python-dotenv - Environment variable management
+python-dotenv>=1.0.0
+
+# FFmpeg is also required but needs to be installed separately on the system
+# Installation instructions are in the README.md
