@@ -284,12 +284,32 @@ async def play_next(ctx):
     
     if next_song and ctx.voice_client:
         try:
-            player = await YTDLSource.from_url(next_song['url'], loop=bot.loop, stream=True)
+            print(f"Playing next: {next_song.get('title', 'Unknown')} - {next_song['url']}")
+            
+            # Extract and play the song
+            loop = bot.loop or asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(next_song['url'], download=False))
+            
+            # Handle if it returned entries (shouldn't for single videos, but just in case)
+            if 'entries' in data:
+                data = data['entries'][0]
+            
+            # Create player
+            filename = data['url']
+            player = YTDLSource(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+            
+            # Play with callback to next song
             ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
                 play_next(ctx), bot.loop))
-            await next_song['ctx'].send(f'Now playing: **{player.title}**')
+            
+            await next_song['ctx'].send(f'Now playing: **{data.get("title", "Unknown")}**')
+            print(f"Successfully started playing: {data.get('title', 'Unknown')}")
         except Exception as e:
-            await next_song['ctx'].send(f'An error occurred: {str(e)}')
+            error_msg = f'Error playing {next_song.get("title", "song")}: {str(e)}'
+            print(error_msg)
+            await next_song['ctx'].send(f'⚠️ Skipped: **{next_song.get("title", "Unknown")}** - {str(e)[:100]}')
+            # Try to play the next song
+            await play_next(ctx)
 
 
 @bot.command(name='pause', help='Pauses the current song')
