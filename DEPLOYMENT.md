@@ -214,6 +214,24 @@ sudo systemctl restart jalebi-bot
 - Check bot has "Connect" and "Speak" permissions
 - Restart the bot: `sudo systemctl restart jalebi-bot`
 
+**Repeated "Sign in to confirm you're not a bot" errors:**
+- Ensure a proper `cookies.txt` is placed in the project root (`/root/JalebiJams/cookies.txt`). Export YouTube cookies while logged in using a browser extension (e.g. "Get cookies.txt"), making sure critical cookies appear: `SID`, `SSID`, `HSID`, `SAPISID`, `PREF`, `LOGIN_INFO`, and `__Secure-*` variants.
+- Run `!!status` in Discord; check `Cookies loaded: True` and `Critical cookies missing: False`.
+- Upgrade yt-dlp: `source venv/bin/activate && pip install -U yt-dlp` then restart service.
+- Install Node.js (improves modern player script handling):
+	```bash
+	curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+	sudo apt-get install -y nodejs
+	```
+- If primary extraction fails, bot auto-falls back to Invidious (and Piped if implemented). You can set a specific Invidious instance: add `INVIDIOUS_HOST=https://invidious.flokinet.to` to `.env` then restart.
+- Temporarily enable verbose yt-dlp logging by adding `YTDLP_VERBOSE=1` to `.env` and restarting; disable after diagnosing.
+
+**Playlist loads very slowly:**
+- Fast playlist mode is on by default; limit is 50 items. Override via `.env`: `MAX_PLAYLIST_ITEMS=30` or disable fast mode with `PLAYLIST_MODE=full`.
+
+**Check runtime status:**
+- Use `!!status` to view yt-dlp version, cookie status, current track, queue length, playlist mode, and whether verbose extraction is active.
+
 **After VPS reboot:**
 The bot should auto-start. If not:
 ```bash
@@ -227,3 +245,22 @@ sudo systemctl start jalebi-bot
 - Keep your VPS updated: `sudo apt update && sudo apt upgrade`
 - Use SSH keys instead of passwords for VPS access
 - Consider using a firewall: `sudo ufw allow 22 && sudo ufw enable`
+
+## Reliability Environment Variables
+
+Add these to `.env` to tweak behavior without code changes:
+
+```
+INVIDIOUS_HOST=https://invidious.flokinet.to   # Override default fallback host
+MAX_PLAYLIST_ITEMS=40                          # Limit playlist enqueue count
+PLAYLIST_MODE=fast                             # 'fast' or 'full'
+YTDLP_VERBOSE=0                                # Set to 1 for debug extraction logs
+YTDLP_USER_AGENT=Mozilla/5.0 (...)             # Custom UA if needed
+```
+
+After editing `.env` always restart:
+
+```bash
+sudo systemctl restart jalebi-bot
+sudo journalctl -u jalebi-bot -n 40 --no-pager
+```

@@ -76,29 +76,43 @@ ytdl_format_options = {
 }
 
 # Add cookies if file exists
-CRITICAL_COOKIE_NAMES = {'SID','HSID','SSID','SAPISID','__Secure-3PAPISID','__Secure-3PSID','__Secure-3PSIDCC','PREF','LOGIN_INFO'}
+CRITICAL_COOKIE_NAMES = {'SID','HSID','SSID','SAPISID','__Secure-3PAPISID','__Secure-3PSID','__Secure-3PSIDCC','PREF','LOGIN_INFO','__Secure-1PSID','__Secure-1PAPISID'}
 COOKIES_LOADED = False
 COOKIE_MISSING_CRITICAL = True
-if os.path.isfile(cookies_file):
-    try:
-        size_ok = os.path.getsize(cookies_file) > 64
-        critical_found = set()
-        if size_ok:
-            with open(cookies_file, 'r', encoding='utf-8', errors='ignore') as cf:
-                for line in cf:
-                    if '\tyoutube.com\t' in line or '\tyoutube-nocookie.com\t' in line:
-                        parts = line.strip().split('\t')
-                        if len(parts) >= 7:
-                            name = parts[5]
-                            if name in CRITICAL_COOKIE_NAMES:
-                                critical_found.add(name)
-                if critical_found:
+CRITICAL_COOKIES_FOUND = set()
+COOKIE_FILE_SIZE = 0
+
+def _scan_cookies():
+    global COOKIES_LOADED, COOKIE_MISSING_CRITICAL, CRITICAL_COOKIES_FOUND, COOKIE_FILE_SIZE
+    COOKIES_LOADED = False
+    COOKIE_MISSING_CRITICAL = True
+    CRITICAL_COOKIES_FOUND = set()
+    COOKIE_FILE_SIZE = 0
+    if os.path.isfile(cookies_file):
+        try:
+            COOKIE_FILE_SIZE = os.path.getsize(cookies_file)
+            size_ok = COOKIE_FILE_SIZE > 128  # Require a bit larger file; tiny exports usually incomplete
+            if size_ok:
+                with open(cookies_file, 'r', encoding='utf-8', errors='ignore') as cf:
+                    for line in cf:
+                        if line.startswith('#') or not line.strip():
+                            continue
+                        if '\tyoutube.com\t' in line or '\tyoutube-nocookie.com\t' in line or '.youtube.com' in line:
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 7:
+                                name = parts[5]
+                                if name in CRITICAL_COOKIE_NAMES:
+                                    CRITICAL_COOKIES_FOUND.add(name)
+                if CRITICAL_COOKIES_FOUND:
                     ytdl_format_options['cookiefile'] = cookies_file
                     COOKIES_LOADED = True
-                    COOKIE_MISSING_CRITICAL = not (CRITICAL_COOKIE_NAMES & critical_found)
-    except Exception:
-        COOKIES_LOADED = False
-        COOKIE_MISSING_CRITICAL = True
+                    COOKIE_MISSING_CRITICAL = not (CRITICAL_COOKIE_NAMES & CRITICAL_COOKIES_FOUND)
+        except Exception as e:
+            print(f"[cookies] scan failed: {e}")
+            COOKIES_LOADED = False
+            COOKIE_MISSING_CRITICAL = True
+
+_scan_cookies()
 
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -315,7 +329,7 @@ async def on_ready():
     print(f'Bot is in {len(bot.guilds)} guilds')
     ytdlp_version = getattr(yt_dlp, '__version__', getattr(getattr(yt_dlp, 'version', None), '__version__', 'unknown'))
     print(f'yt-dlp version: {ytdlp_version} | Python: {platform.python_version()}')
-    print(f'Cookies loaded: {COOKIES_LOADED} | Critical missing: {COOKIE_MISSING_CRITICAL}')
+    print(f'Cookies loaded: {COOKIES_LOADED} | Critical missing: {COOKIE_MISSING_CRITICAL} | Found: {sorted(CRITICAL_COOKIES_FOUND)} | Size: {COOKIE_FILE_SIZE} bytes')
     print(f'Invidious host: {INVIDIOUS_HOST}')
     if not COOKIES_LOADED:
         print('WARNING: cookies.txt not fully loaded or missing — YouTube may trigger bot detection.')
@@ -585,6 +599,8 @@ async def status(ctx):
         f"Python: {platform.python_version()}",
         f"Cookies loaded: {COOKIES_LOADED}",
         f"Critical cookies missing: {COOKIE_MISSING_CRITICAL}",
+        f"Cookie file size: {COOKIE_FILE_SIZE} bytes",
+        f"Critical found: {', '.join(sorted(CRITICAL_COOKIES_FOUND)) or 'None'}",
         f"Invidious host: {INVIDIOUS_HOST}",
         f"Current track: {current or 'None'}",
         f"Queue length: {pending}",
@@ -592,6 +608,12 @@ async def status(ctx):
         f"Verbose yt-dlp: {VERBOSE_YTDLP}",
     ]
     await ctx.send("Status:\n" + '\n'.join(report))
+
+
+@bot.command(name='reloadcookies', help='Re-scan cookies.txt for YouTube auth cookies')
+async def reloadcookies(ctx):
+    _scan_cookies()
+    await status(ctx)
 
 
 @bot.command(name='volume', help='Changes the volume (0-100)')
