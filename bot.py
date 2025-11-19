@@ -313,7 +313,8 @@ async def on_ready():
     """Event handler for when the bot is ready."""
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
-    print(f'yt-dlp version: {yt_dlp.__version__} | Python: {platform.python_version()}')
+    ytdlp_version = getattr(yt_dlp, '__version__', getattr(getattr(yt_dlp, 'version', None), '__version__', 'unknown'))
+    print(f'yt-dlp version: {ytdlp_version} | Python: {platform.python_version()}')
     print(f'Cookies loaded: {COOKIES_LOADED} | Critical missing: {COOKIE_MISSING_CRITICAL}')
     print(f'Invidious host: {INVIDIOUS_HOST}')
     if not COOKIES_LOADED:
@@ -578,8 +579,9 @@ async def status(ctx):
     queue = get_queue(ctx.guild.id)
     pending = len(queue.queue)
     current = queue.current.get('title') if queue.current else None
+    ytdlp_version = getattr(yt_dlp, '__version__', getattr(getattr(yt_dlp, 'version', None), '__version__', 'unknown'))
     report = [
-        f"yt-dlp: {yt_dlp.__version__}",
+        f"yt-dlp: {ytdlp_version}",
         f"Python: {platform.python_version()}",
         f"Cookies loaded: {COOKIES_LOADED}",
         f"Critical cookies missing: {COOKIE_MISSING_CRITICAL}",
