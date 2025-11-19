@@ -31,20 +31,23 @@ import os.path
 cookies_file = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
 ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'extractaudio': True,
-    'audioformat': 'mp3',
+    'format': 'bestaudio*',  # More flexible format selection
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': False,  # Changed to allow playlists
     'playlistend': 50,  # Limit playlists to first 50 songs
     'nocheckcertificate': True,
-    'ignoreerrors': False,
+    'ignoreerrors': True,  # Skip unavailable videos in playlists
     'logtostderr': False,
-    'quiet': True,  # Back to quiet mode
-    'no_warnings': True,  # Back to no warnings
+    'quiet': True,
+    'no_warnings': True,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'web'],  # Use multiple clients for better compatibility
+        }
+    },
 }
 
 # Add cookies if file exists
