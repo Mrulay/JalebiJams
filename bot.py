@@ -10,6 +10,7 @@ import yt_dlp
 import asyncio
 from dotenv import load_dotenv
 import traceback
+import itertools
 
 # Load environment variables
 load_dotenv()
@@ -131,11 +132,16 @@ async def enqueue_playlist_fast(entries, ctx, queue):
     Only basic fields are stored. Full extraction happens when each track plays.
     """
     added = 0
-    for entry in entries[:MAX_PLAYLIST_ITEMS]:
+    # Support both list-like and generator/iterable entries
+    if hasattr(entries, '__getitem__'):
+        iterable = entries[:MAX_PLAYLIST_ITEMS]
+    else:
+        iterable = itertools.islice(entries, MAX_PLAYLIST_ITEMS)
+
+    for entry in iterable:
         if not entry:
             continue
         video_id = entry.get('id')
-        base_url = None
         if video_id and len(video_id) == 11:
             base_url = f"https://www.youtube.com/watch?v={video_id}"
         else:
