@@ -40,8 +40,15 @@ _INVIDIOUS_DEFAULTS = [
     'https://invidious.jing.rocks',
     'https://invidious.flokinet.to',
     'https://invidious.privacydev.net',
+    'https://invidious.einfachzocken.eu',
 ]
 INVIDIOUS_HOST = (INVIDIOUS_HOST_ENV or _INVIDIOUS_DEFAULTS[0]).rstrip('/')
+PIPED_HOSTS = [
+    'https://piped.video',
+    'https://piped.mha.fi',
+    'https://piped.lunar.icu'
+]
+FALLBACK_ONLY = os.getenv('FALLBACK_ONLY', '0') == '1'  # Force using alternative frontends only
 
 USER_AGENT = os.getenv('YTDLP_USER_AGENT', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36')
 
@@ -91,7 +98,7 @@ def _scan_cookies():
     if os.path.isfile(cookies_file):
         try:
             COOKIE_FILE_SIZE = os.path.getsize(cookies_file)
-            size_ok = COOKIE_FILE_SIZE > 128  # Require a bit larger file; tiny exports usually incomplete
+            size_ok = COOKIE_FILE_SIZE > 64  # Allow smaller valid exports
             if size_ok:
                 with open(cookies_file, 'r', encoding='utf-8', errors='ignore') as cf:
                     for line in cf:
@@ -258,6 +265,78 @@ def pick_invidious_audio(data: dict) -> str | None:
         return audio[-1]['url']
     return None
 
+def invidious_api_video(video_id: str) -> dict | None:  # replace previous definition with rotating hosts
+    hosts = [INVIDIOUS_HOST] + [h for h in _INVIDIOUS_DEFAULTS if h.rstrip('/') != INVIDIOUS_HOST]
+    for host in hosts:
+        try:
+            resp = requests.get(f"{host}/api/v1/videos/{video_id}", timeout=8)
+            if resp.status_code == 200:
+                if host != INVIDIOUS_HOST:
+                    print(f"[invidious] switched host: {host}")
+                return resp.json()
+        except Exception as e:
+            print(f"[invidious] host {host} failed: {e}")
+    return None
+
+def piped_api_video(video_id: str) -> dict | None:
+    for host in PIPED_HOSTS:
+        try:
+            resp = requests.get(f"{host}/streams/{video_id}", timeout=8)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            print(f"[piped] host {host} failed: {e}")
+    return None
+
+def pick_piped_audio(data: dict) -> str | None:
+    if not data:
+        return None
+    streams = data.get('audioStreams') or []
+    usable = [s for s in streams if s.get('url')]
+    if not usable:
+        return None
+    usable.sort(key=lambda s: s.get('bitrate') or 0)
+    return usable[-1]['url']
+
+async def resolve_audio(url: str):
+    """Unified resolution pipeline respecting FALLBACK_ONLY.
+    Returns (playable_url, data_dict, fallback_name_or_None)
+    """
+    vid = extract_video_id(url)
+    data = None
+    used = None
+    if not FALLBACK_ONLY:
+        try:
+            data = await extract_info_safe(url, download=False)
+        except Exception as e:
+            print(f"[resolve] direct failed: {e}")
+    if data and 'entries' in data:
+        data = data['entries'][0]
+    playable = select_playable_url(data) if data else None
+    if not playable and vid:
+        inv = invidious_api_video(vid)
+        if inv:
+            playable = pick_invidious_audio(inv)
+            if playable:
+                data = {
+                    'title': inv.get('title', 'Unknown (Invidious)'),
+                    'url': playable,
+                    'duration': inv.get('lengthSeconds'),
+                }
+                used = 'Invidious'
+    if not playable and vid:
+        piped = piped_api_video(vid)
+        if piped:
+            playable = pick_piped_audio(piped)
+            if playable:
+                data = {
+                    'title': piped.get('title', 'Unknown (Piped)'),
+                    'url': playable,
+                    'duration': piped.get('duration'),
+                }
+                used = 'Piped'
+    return playable, data, used
+
 
 class YTDLSource(discord.PCMVolumeTransformer):
     """YouTube audio source for Discord voice client."""
@@ -335,6 +414,8 @@ async def on_ready():
         print('WARNING: cookies.txt not fully loaded or missing — YouTube may trigger bot detection.')
     elif COOKIE_MISSING_CRITICAL:
         print('NOTICE: Some critical cookies missing; consider exporting with browser extension for full set.')
+    if FALLBACK_ONLY:
+        print('FALLBACK_ONLY active: using Invidious/Piped only.')
 
 
 @bot.event
@@ -434,48 +515,20 @@ async def play(ctx, *, url):
                     if not ctx.voice_client.is_playing():
                         await play_next(ctx)
                     return
-            # Single video or fallback
-            data = None
-            try:
-                data = await extract_info_safe(url, download=False)
-            except Exception as primary_err:
-                print(f"[play] primary extraction failed: {primary_err}")
-                # If cookies absent or primary failed with auth message -> try Invidious
-                vid = extract_video_id(url)
-                if vid:
-                    inv = invidious_api_video(vid)
-                    if inv:
-                        playable = pick_invidious_audio(inv)
-                        if playable:
-                            fake_data = {
-                                'title': inv.get('title', 'Unknown (Invidious)'),
-                                'url': playable,
-                                'duration': inv.get('lengthSeconds'),
-                            }
-                            player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=fake_data)
-                            if ctx.voice_client.is_playing():
-                                queue = get_queue(ctx.guild.id)
-                                queue.add({'url': url, 'title': fake_data['title'], 'ctx': ctx})
-                                await ctx.send(f'Added (fallback): **{fake_data['title']}**')
-                            else:
-                                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-                                await ctx.send(f'Now playing (fallback): **{fake_data['title']}**')
-                            return
-                await ctx.send(f"⚠️ Extraction failed: {str(primary_err)[:90]}")
-                return
-            if 'entries' in data:
-                data = data['entries'][0]
-            playable = select_playable_url(data)
+            # Single video resolution via unified pipeline
+            playable, data, used = await resolve_audio(url)
             if not playable:
-                raise Exception('No playable audio format found')
+                raise Exception('No playable audio format found (providers failed)')
             player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=data)
             if ctx.voice_client.is_playing():
                 queue = get_queue(ctx.guild.id)
                 queue.add({'url': url, 'title': player.title, 'ctx': ctx})
-                await ctx.send(f'Added to queue: **{player.title}**')
+                suffix = f" (fallback:{used})" if used else ""
+                await ctx.send(f'Added to queue: **{player.title}**{suffix}')
             else:
                 ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-                await ctx.send(f'Now playing: **{player.title}**')
+                prefix = 'Now playing' if not used else f'Now playing ({used} fallback)'
+                await ctx.send(f'{prefix}: **{player.title}**')
         except Exception as e:
             await ctx.send(f'⚠️ Error: {str(e)[:120]}')
             traceback.print_exc()
@@ -488,35 +541,13 @@ async def play_next(ctx):
     
     if next_song and ctx.voice_client:
         try:
-            data = None
-            try:
-                data = await extract_info_safe(next_song['url'], download=False)
-            except Exception as primary_err:
-                print(f"[next] primary extraction failed: {primary_err}")
-                vid = extract_video_id(next_song['url'])
-                if vid:
-                    inv = invidious_api_video(vid)
-                    if inv:
-                        playable = pick_invidious_audio(inv)
-                        if playable:
-                            fake_data = {
-                                'title': inv.get('title', 'Unknown (Invidious)'),
-                                'url': playable,
-                                'duration': inv.get('lengthSeconds'),
-                            }
-                            player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=fake_data)
-                            ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-                            await next_song['ctx'].send(f"Now playing (fallback): **{fake_data['title']}**")
-                            return
-                raise primary_err
-            if 'entries' in data:
-                data = data['entries'][0]
-            playable = select_playable_url(data)
+            playable, data, used = await resolve_audio(next_song['url'])
             if not playable:
-                raise Exception('No playable format found')
+                raise Exception('No playable format found (providers failed)')
             player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=data)
             ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-            await next_song['ctx'].send(f"Now playing: **{data.get('title', 'Unknown')}**")
+            tag = f" ({used} fallback)" if used else ""
+            await next_song['ctx'].send(f"Now playing{tag}: **{data.get('title', 'Unknown')}**")
         except Exception as e:
             await next_song['ctx'].send(f"⚠️ Skipped: {next_song.get('title','Unknown')} - {str(e)[:90]}")
             await play_next(ctx)
@@ -602,6 +633,7 @@ async def status(ctx):
         f"Cookie file size: {COOKIE_FILE_SIZE} bytes",
         f"Critical found: {', '.join(sorted(CRITICAL_COOKIES_FOUND)) or 'None'}",
         f"Invidious host: {INVIDIOUS_HOST}",
+        f"Fallback only: {FALLBACK_ONLY}",
         f"Current track: {current or 'None'}",
         f"Queue length: {pending}",
         f"Playlist mode: {'fast' if FAST_PLAYLIST_MODE else 'full'}",
@@ -614,6 +646,18 @@ async def status(ctx):
 async def reloadcookies(ctx):
     _scan_cookies()
     await status(ctx)
+
+@bot.command(name='pingyt', help='Test YouTube extraction health chain')
+async def pingyt(ctx):
+    test_id = 'dQw4w9WgXcQ'
+    url = f'https://www.youtube.com/watch?v={test_id}'
+    stages = []
+    playable, data, used = await resolve_audio(url)
+    if playable:
+        stages.append(f"resolved:{used or 'direct'}")
+    else:
+        stages.append('failed')
+    await ctx.send('pingyt: ' + ', '.join(stages))
 
 
 @bot.command(name='volume', help='Changes the volume (0-100)')
