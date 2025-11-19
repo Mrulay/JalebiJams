@@ -9,6 +9,7 @@ from discord.ext import commands
 import yt_dlp
 import asyncio
 from dotenv import load_dotenv
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -60,6 +61,90 @@ ffmpeg_options = {
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+# Configuration (can be overridden via environment variables)
+MAX_PLAYLIST_ITEMS = int(os.getenv('MAX_PLAYLIST_ITEMS', '50'))
+FAST_PLAYLIST_MODE = os.getenv('PLAYLIST_MODE', 'fast').lower() == 'fast'  # fast = don't prefetch full metadata
+
+
+def _build_ytdl():
+    """Rebuild YoutubeDL instance (used for fallback attempts when options change)."""
+    return yt_dlp.YoutubeDL(ytdl_format_options)
+
+
+async def extract_info_safe(url: str, *, download: bool = False, process: bool = True):
+    """Extract info with layered fallbacks.
+
+    Fallback strategy:
+    1. Try with current options (stream mode)
+    2. Retry with simpler player_client if formats missing
+    3. Retry forcing default player client
+    4. As last resort: download the file (slower) and use local filename
+    """
+    loop = asyncio.get_event_loop()
+
+    async def _run(extractor_opts_override=None, force_download=False):
+        opts = ytdl_format_options.copy()
+        if extractor_opts_override:
+            opts['extractor_args'] = extractor_opts_override
+        ytdl_local = yt_dlp.YoutubeDL(opts)
+        return await loop.run_in_executor(
+            None,
+            lambda: ytdl_local.extract_info(url, download=force_download or download, process=process)
+        )
+
+    try:
+        data = await _run()
+    except Exception as e:
+        # First fallback: simplify player client
+        try:
+            data = await _run({'youtube': {'player_client': ['default']}})
+        except Exception:
+            # Second fallback: download actual file
+            data = await _run({'youtube': {'player_client': ['default']}}, force_download=True)
+    return data
+
+
+def select_playable_url(data: dict):
+    """Return a playable audio URL (or local filename) from yt-dlp data."""
+    if not data:
+        return None
+    # Direct/url field
+    direct = data.get('url')
+    if direct:
+        return direct
+    # Formats fallback
+    formats = data.get('formats') or []
+    audio = [f for f in formats if f.get('acodec') and f.get('acodec') != 'none' and f.get('url')]
+    if audio:
+        # Prefer highest abr
+        audio.sort(key=lambda f: f.get('abr') or 0)
+        return audio[-1]['url']
+    # If downloaded
+    if data.get('_filename'):
+        return data['_filename']
+    return None
+
+
+async def enqueue_playlist_fast(entries, ctx, queue):
+    """Enqueue playlist entries quickly without full metadata extraction.
+    Only basic fields are stored. Full extraction happens when each track plays.
+    """
+    added = 0
+    for entry in entries[:MAX_PLAYLIST_ITEMS]:
+        if not entry:
+            continue
+        video_id = entry.get('id')
+        base_url = None
+        if video_id and len(video_id) == 11:
+            base_url = f"https://www.youtube.com/watch?v={video_id}"
+        else:
+            base_url = entry.get('webpage_url') or entry.get('url')
+        if not base_url:
+            continue
+        queue.add({'url': base_url, 'title': entry.get('title') or 'Unknown', 'ctx': ctx})
+        added += 1
+    return added
 
 
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -206,75 +291,47 @@ async def play(ctx, *, url):
     async with ctx.typing():
         try:
             loop = bot.loop or asyncio.get_event_loop()
-            
-            # Quick check if it's a playlist URL
-            is_playlist_url = ('playlist' in url or ('youtube.com/watch' in url and 'list=' in url and '&list=RDAMVM' not in url))
-            
+            is_playlist_url = ('/playlist?' in url) or ('youtube.com/watch' in url and 'list=' in url and 'RDAMVM' not in url)
+
             if is_playlist_url:
-                # For playlists: extract only basic info, don't download full metadata
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False, process=False))
-                
-                if 'entries' in data and data.get('_type') == 'playlist':
+                # Fetch playlist shell without processing full metadata
+                data = await extract_info_safe(url, download=False, process=False)
+                if data and 'entries' in data:
                     entries = data['entries']
                     playlist_title = data.get('title', 'playlist')
                     queue = get_queue(ctx.guild.id)
-                    
-                    # Only get URLs quickly, don't fetch full metadata yet
-                    added_count = 0
-                    for entry in entries:
-                        if entry:
-                            # For playlists, just store the video ID/URL
-                            video_id = entry.get('id') or entry.get('url')
-                            if video_id:
-                                song_url = f"https://www.youtube.com/watch?v={video_id}" if len(video_id) == 11 else entry.get('url')
-                                song_title = entry.get('title', 'Unknown')
-                                queue.add({'url': song_url, 'title': song_title, 'ctx': ctx})
-                                added_count += 1
-                    
-                    await ctx.send(f'📝 Added **{added_count}** songs from playlist: **{playlist_title}**\nStarting playback...')
-                    
-                    # Start playing immediately
+                    added = await enqueue_playlist_fast(entries, ctx, queue) if FAST_PLAYLIST_MODE else 0
+                    if not FAST_PLAYLIST_MODE:
+                        # Full metadata mode: extract each (slow)
+                        for entry in entries[:MAX_PLAYLIST_ITEMS]:
+                            if not entry:
+                                continue
+                            video_id = entry.get('id')
+                            url_single = f"https://www.youtube.com/watch?v={video_id}" if video_id else entry.get('webpage_url')
+                            queue.add({'url': url_single, 'title': entry.get('title') or 'Unknown', 'ctx': ctx})
+                        added = min(len(entries), MAX_PLAYLIST_ITEMS)
+                    await ctx.send(f"📝 Added **{added}** tracks from playlist: **{playlist_title}**")
                     if not ctx.voice_client.is_playing():
                         await play_next(ctx)
-                else:
-                    # Fallback to single video
-                    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-                    if 'entries' in data:
-                        data = data['entries'][0]
-                    filename = data['url']
-                    player = YTDLSource(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-                    
-                    if ctx.voice_client.is_playing():
-                        queue = get_queue(ctx.guild.id)
-                        queue.add({'url': url, 'title': player.title, 'ctx': ctx})
-                        await ctx.send(f'Added to queue: **{player.title}**')
-                    else:
-                        ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                            play_next(ctx), bot.loop))
-                        await ctx.send(f'Now playing: **{player.title}**')
+                    return
+            # Single video or fallback
+            data = await extract_info_safe(url, download=False)
+            if 'entries' in data:
+                data = data['entries'][0]
+            playable = select_playable_url(data)
+            if not playable:
+                raise Exception('No playable audio format found')
+            player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=data)
+            if ctx.voice_client.is_playing():
+                queue = get_queue(ctx.guild.id)
+                queue.add({'url': url, 'title': player.title, 'ctx': ctx})
+                await ctx.send(f'Added to queue: **{player.title}**')
             else:
-                # Single video - full processing
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-                
-                # Handle search results or direct URLs
-                if 'entries' in data:
-                    data = data['entries'][0]
-                
-                # Create player from the data
-                filename = data['url']
-                player = YTDLSource(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-                
-                if ctx.voice_client.is_playing():
-                    queue = get_queue(ctx.guild.id)
-                    queue.add({'url': url, 'title': player.title, 'ctx': ctx})
-                    await ctx.send(f'Added to queue: **{player.title}**')
-                else:
-                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                        play_next(ctx), bot.loop))
-                    await ctx.send(f'Now playing: **{player.title}**')
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+                await ctx.send(f'Now playing: **{player.title}**')
         except Exception as e:
-            await ctx.send(f'An error occurred: {str(e)}')
-            print(f'Error in play command: {e}')  # Log to console for debugging
+            await ctx.send(f'⚠️ Error: {str(e)}')
+            traceback.print_exc()
 
 
 async def play_next(ctx):
@@ -284,31 +341,17 @@ async def play_next(ctx):
     
     if next_song and ctx.voice_client:
         try:
-            print(f"Playing next: {next_song.get('title', 'Unknown')} - {next_song['url']}")
-            
-            # Extract and play the song
-            loop = bot.loop or asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(next_song['url'], download=False))
-            
-            # Handle if it returned entries (shouldn't for single videos, but just in case)
+            data = await extract_info_safe(next_song['url'], download=False)
             if 'entries' in data:
                 data = data['entries'][0]
-            
-            # Create player
-            filename = data['url']
-            player = YTDLSource(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-            
-            # Play with callback to next song
-            ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                play_next(ctx), bot.loop))
-            
-            await next_song['ctx'].send(f'Now playing: **{data.get("title", "Unknown")}**')
-            print(f"Successfully started playing: {data.get('title', 'Unknown')}")
+            playable = select_playable_url(data)
+            if not playable:
+                raise Exception('No playable format found')
+            player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=data)
+            ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+            await next_song['ctx'].send(f'Now playing: **{data.get('title', 'Unknown')}**')
         except Exception as e:
-            error_msg = f'Error playing {next_song.get("title", "song")}: {str(e)}'
-            print(error_msg)
-            await next_song['ctx'].send(f'⚠️ Skipped: **{next_song.get("title", "Unknown")}** - {str(e)[:100]}')
-            # Try to play the next song
+            await next_song['ctx'].send(f"⚠️ Skipped: {next_song.get('title','Unknown')} - {str(e)[:90]}")
             await play_next(ctx)
 
 
