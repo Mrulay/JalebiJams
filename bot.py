@@ -6,6 +6,7 @@ A Discord bot that plays YouTube music in voice channels.
 import os
 import re
 import json
+import platform
 import discord
 from discord.ext import commands
 import yt_dlp
@@ -34,41 +35,70 @@ bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 import os.path
 
 cookies_file = os.path.join(os.path.dirname(__file__), 'cookies.txt')
-INVIDIOUS_HOST = os.getenv('INVIDIOUS_HOST', 'https://invidious.snopyta.org').rstrip('/')
+INVIDIOUS_HOST_ENV = os.getenv('INVIDIOUS_HOST')
+_INVIDIOUS_DEFAULTS = [
+    'https://invidious.jing.rocks',
+    'https://invidious.flokinet.to',
+    'https://invidious.privacydev.net',
+]
+INVIDIOUS_HOST = (INVIDIOUS_HOST_ENV or _INVIDIOUS_DEFAULTS[0]).rstrip('/')
+
+USER_AGENT = os.getenv('YTDLP_USER_AGENT', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36')
+
+VERBOSE_YTDLP = os.getenv('YTDLP_VERBOSE', '0') == '1'
 
 ytdl_format_options = {
     'format': 'bestaudio*',  # More flexible format selection
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
-    'noplaylist': False,  # Changed to allow playlists
-    'playlistend': 50,  # Limit playlists to first 50 songs
+    'noplaylist': False,  # Allow playlists
+    'playlistend': 50,
     'nocheckcertificate': True,
-    'ignoreerrors': True,  # Skip unavailable videos in playlists
+    'ignoreerrors': True,
     'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
+    'quiet': not VERBOSE_YTDLP,
+    'no_warnings': not VERBOSE_YTDLP,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
+    'http_headers': {
+        'User-Agent': USER_AGENT,
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': '*/*',
+        'Origin': 'https://www.youtube.com',
+        'Referer': 'https://www.youtube.com/',
+    },
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'web'],  # Use multiple clients for better compatibility
+            'player_client': ['android', 'web', 'ios'],
         }
     },
+    'retries': 3,
 }
 
 # Add cookies if file exists
+CRITICAL_COOKIE_NAMES = {'SID','HSID','SSID','SAPISID','__Secure-3PAPISID','__Secure-3PSID','__Secure-3PSIDCC','PREF','LOGIN_INFO'}
 COOKIES_LOADED = False
+COOKIE_MISSING_CRITICAL = True
 if os.path.isfile(cookies_file):
-    # Minimal validation: file not empty and contains at least one youtube domain cookie
     try:
-        if os.path.getsize(cookies_file) > 32:
+        size_ok = os.path.getsize(cookies_file) > 64
+        critical_found = set()
+        if size_ok:
             with open(cookies_file, 'r', encoding='utf-8', errors='ignore') as cf:
-                content = cf.read()
-                if 'youtube.com' in content:
+                for line in cf:
+                    if '\tyoutube.com\t' in line or '\tyoutube-nocookie.com\t' in line:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 7:
+                            name = parts[5]
+                            if name in CRITICAL_COOKIE_NAMES:
+                                critical_found.add(name)
+                if critical_found:
                     ytdl_format_options['cookiefile'] = cookies_file
                     COOKIES_LOADED = True
+                    COOKIE_MISSING_CRITICAL = not (CRITICAL_COOKIE_NAMES & critical_found)
     except Exception:
         COOKIES_LOADED = False
+        COOKIE_MISSING_CRITICAL = True
 
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -110,15 +140,16 @@ async def extract_info_safe(url: str, *, download: bool = False, process: bool =
 
     try:
         data = await _run()
-    except Exception:
-        # First fallback: simplify player client
+    except Exception as e1:
+        print(f"[extract] primary failed: {e1}")
         try:
             data = await _run({'youtube': {'player_client': ['default']}})
-        except Exception:
-            # Second fallback: attempt download
+        except Exception as e2:
+            print(f"[extract] fallback client failed: {e2}")
             try:
                 data = await _run({'youtube': {'player_client': ['default']}}, force_download=True)
             except Exception as final_err:
+                print(f"[extract] force download failed: {final_err}")
                 raise final_err
     return data
 
@@ -282,6 +313,13 @@ async def on_ready():
     """Event handler for when the bot is ready."""
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
+    print(f'yt-dlp version: {yt_dlp.__version__} | Python: {platform.python_version()}')
+    print(f'Cookies loaded: {COOKIES_LOADED} | Critical missing: {COOKIE_MISSING_CRITICAL}')
+    print(f'Invidious host: {INVIDIOUS_HOST}')
+    if not COOKIES_LOADED:
+        print('WARNING: cookies.txt not fully loaded or missing — YouTube may trigger bot detection.')
+    elif COOKIE_MISSING_CRITICAL:
+        print('NOTICE: Some critical cookies missing; consider exporting with browser extension for full set.')
 
 
 @bot.event
@@ -386,6 +424,7 @@ async def play(ctx, *, url):
             try:
                 data = await extract_info_safe(url, download=False)
             except Exception as primary_err:
+                print(f"[play] primary extraction failed: {primary_err}")
                 # If cookies absent or primary failed with auth message -> try Invidious
                 vid = extract_video_id(url)
                 if vid:
@@ -438,6 +477,7 @@ async def play_next(ctx):
             try:
                 data = await extract_info_safe(next_song['url'], download=False)
             except Exception as primary_err:
+                print(f"[next] primary extraction failed: {primary_err}")
                 vid = extract_video_id(next_song['url'])
                 if vid:
                     inv = invidious_api_video(vid)
@@ -531,6 +571,25 @@ async def show_queue(ctx):
         message += "No songs in queue."
     
     await ctx.send(message)
+
+
+@bot.command(name='status', help='Shows bot playback and extraction status')
+async def status(ctx):
+    queue = get_queue(ctx.guild.id)
+    pending = len(queue.queue)
+    current = queue.current.get('title') if queue.current else None
+    report = [
+        f"yt-dlp: {yt_dlp.__version__}",
+        f"Python: {platform.python_version()}",
+        f"Cookies loaded: {COOKIES_LOADED}",
+        f"Critical cookies missing: {COOKIE_MISSING_CRITICAL}",
+        f"Invidious host: {INVIDIOUS_HOST}",
+        f"Current track: {current or 'None'}",
+        f"Queue length: {pending}",
+        f"Playlist mode: {'fast' if FAST_PLAYLIST_MODE else 'full'}",
+        f"Verbose yt-dlp: {VERBOSE_YTDLP}",
+    ]
+    await ctx.send("Status:\n" + '\n'.join(report))
 
 
 @bot.command(name='volume', help='Changes the volume (0-100)')
