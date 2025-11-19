@@ -4,6 +4,8 @@ A Discord bot that plays YouTube music in voice channels.
 """
 
 import os
+import re
+import json
 import discord
 from discord.ext import commands
 import yt_dlp
@@ -11,6 +13,7 @@ import asyncio
 from dotenv import load_dotenv
 import traceback
 import itertools
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +34,7 @@ bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 import os.path
 
 cookies_file = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+INVIDIOUS_HOST = os.getenv('INVIDIOUS_HOST', 'https://invidious.snopyta.org').rstrip('/')
 
 ytdl_format_options = {
     'format': 'bestaudio*',  # More flexible format selection
@@ -53,8 +57,18 @@ ytdl_format_options = {
 }
 
 # Add cookies if file exists
+COOKIES_LOADED = False
 if os.path.isfile(cookies_file):
-    ytdl_format_options['cookiefile'] = cookies_file
+    # Minimal validation: file not empty and contains at least one youtube domain cookie
+    try:
+        if os.path.getsize(cookies_file) > 32:
+            with open(cookies_file, 'r', encoding='utf-8', errors='ignore') as cf:
+                content = cf.read()
+                if 'youtube.com' in content:
+                    ytdl_format_options['cookiefile'] = cookies_file
+                    COOKIES_LOADED = True
+    except Exception:
+        COOKIES_LOADED = False
 
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -96,13 +110,16 @@ async def extract_info_safe(url: str, *, download: bool = False, process: bool =
 
     try:
         data = await _run()
-    except Exception as e:
+    except Exception:
         # First fallback: simplify player client
         try:
             data = await _run({'youtube': {'player_client': ['default']}})
         except Exception:
-            # Second fallback: download actual file
-            data = await _run({'youtube': {'player_client': ['default']}}, force_download=True)
+            # Second fallback: attempt download
+            try:
+                data = await _run({'youtube': {'player_client': ['default']}}, force_download=True)
+            except Exception as final_err:
+                raise final_err
     return data
 
 
@@ -151,6 +168,50 @@ async def enqueue_playlist_fast(entries, ctx, queue):
         queue.add({'url': base_url, 'title': entry.get('title') or 'Unknown', 'ctx': ctx})
         added += 1
     return added
+
+
+def extract_video_id(url: str) -> str | None:
+    """Extract YouTube video ID from multiple URL patterns."""
+    patterns = [
+        r"v=([A-Za-z0-9_-]{11})",
+        r"youtu\.be/([A-Za-z0-9_-]{11})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{11})"
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    if len(url) == 11 and re.match(r"^[A-Za-z0-9_-]{11}$", url):
+        return url
+    return None
+
+
+def invidious_api_video(video_id: str) -> dict | None:
+    """Fetch video information from Invidious as a fallback."""
+    try:
+        resp = requests.get(f"{INVIDIOUS_HOST}/api/v1/videos/{video_id}", timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        return None
+    return None
+
+
+def pick_invidious_audio(data: dict) -> str | None:
+    """Select an audio stream URL from Invidious API response."""
+    if not data:
+        return None
+    adaptive = data.get('adaptiveFormats') or []
+    audio = [f for f in adaptive if f.get('type', '').startswith('audio/') and f.get('url')]
+    if not audio:
+        # Try formatStreams fallback
+        streams = data.get('formatStreams') or []
+        audio = [f for f in streams if f.get('type', '').startswith('audio/') and f.get('url')]
+    if audio:
+        # Prefer highest bitrate
+        audio.sort(key=lambda f: f.get('bitrate') or 0)
+        return audio[-1]['url']
+    return None
 
 
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -321,7 +382,33 @@ async def play(ctx, *, url):
                         await play_next(ctx)
                     return
             # Single video or fallback
-            data = await extract_info_safe(url, download=False)
+            data = None
+            try:
+                data = await extract_info_safe(url, download=False)
+            except Exception as primary_err:
+                # If cookies absent or primary failed with auth message -> try Invidious
+                vid = extract_video_id(url)
+                if vid:
+                    inv = invidious_api_video(vid)
+                    if inv:
+                        playable = pick_invidious_audio(inv)
+                        if playable:
+                            fake_data = {
+                                'title': inv.get('title', 'Unknown (Invidious)'),
+                                'url': playable,
+                                'duration': inv.get('lengthSeconds'),
+                            }
+                            player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=fake_data)
+                            if ctx.voice_client.is_playing():
+                                queue = get_queue(ctx.guild.id)
+                                queue.add({'url': url, 'title': fake_data['title'], 'ctx': ctx})
+                                await ctx.send(f'Added (fallback): **{fake_data['title']}**')
+                            else:
+                                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+                                await ctx.send(f'Now playing (fallback): **{fake_data['title']}**')
+                            return
+                await ctx.send(f"⚠️ Extraction failed: {str(primary_err)[:90]}")
+                return
             if 'entries' in data:
                 data = data['entries'][0]
             playable = select_playable_url(data)
@@ -336,7 +423,7 @@ async def play(ctx, *, url):
                 ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
                 await ctx.send(f'Now playing: **{player.title}**')
         except Exception as e:
-            await ctx.send(f'⚠️ Error: {str(e)}')
+            await ctx.send(f'⚠️ Error: {str(e)[:120]}')
             traceback.print_exc()
 
 
@@ -347,7 +434,26 @@ async def play_next(ctx):
     
     if next_song and ctx.voice_client:
         try:
-            data = await extract_info_safe(next_song['url'], download=False)
+            data = None
+            try:
+                data = await extract_info_safe(next_song['url'], download=False)
+            except Exception as primary_err:
+                vid = extract_video_id(next_song['url'])
+                if vid:
+                    inv = invidious_api_video(vid)
+                    if inv:
+                        playable = pick_invidious_audio(inv)
+                        if playable:
+                            fake_data = {
+                                'title': inv.get('title', 'Unknown (Invidious)'),
+                                'url': playable,
+                                'duration': inv.get('lengthSeconds'),
+                            }
+                            player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=fake_data)
+                            ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+                            await next_song['ctx'].send(f"Now playing (fallback): **{fake_data['title']}**")
+                            return
+                raise primary_err
             if 'entries' in data:
                 data = data['entries'][0]
             playable = select_playable_url(data)
@@ -355,7 +461,7 @@ async def play_next(ctx):
                 raise Exception('No playable format found')
             player = YTDLSource(discord.FFmpegPCMAudio(playable, **ffmpeg_options), data=data)
             ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-            await next_song['ctx'].send(f'Now playing: **{data.get('title', 'Unknown')}**')
+            await next_song['ctx'].send(f"Now playing: **{data.get('title', 'Unknown')}**")
         except Exception as e:
             await next_song['ctx'].send(f"⚠️ Skipped: {next_song.get('title','Unknown')} - {str(e)[:90]}")
             await play_next(ctx)

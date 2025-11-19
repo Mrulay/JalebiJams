@@ -12,5 +12,8 @@ PyNaCl>=1.5.0
 # python-dotenv - Environment variable management
 python-dotenv>=1.0.0
 
+# requests - HTTP client for Invidious fallback API
+requests>=2.31.0
+
 # FFmpeg is also required but needs to be installed separately on the system
 # Installation instructions are in the README.md
